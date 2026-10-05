@@ -200,14 +200,38 @@ function collectEdges(seed, bounds) {
   const minMY = Math.floor(search.minY / MACRO_SIZE) - 2;
   const maxMY = Math.floor(search.maxY / MACRO_SIZE) + 2;
   const edges = new Map();
+  const occupiedPairs = new Set();
 
+  // Required tree obligations are established first.
   for (let my = minMY; my <= maxMY; my += 1) {
     for (let mx = minMX; mx <= maxMX; mx += 1) {
       const parent = parentFor(seed, mx, my);
-      if (parent) addEdge(edges, makeEdge(seed, mx, my, parent[0], parent[1], "tree"));
+      if (!parent) continue;
+      const [pa, pb] = canonicalPair(mx, my, parent[0], parent[1]);
+      occupiedPairs.add(pa + "|" + pb);
+      addEdge(edges, makeEdge(seed, mx, my, parent[0], parent[1], "tree"));
+    }
+  }
 
-      if (loopAllowed(seed, mx, my, "x")) addEdge(edges, makeEdge(seed, mx, my, mx + 1, my, "loop"));
-      if (loopAllowed(seed, mx, my, "y")) addEdge(edges, makeEdge(seed, mx, my, mx, my + 1, "loop"));
+  // Optional loops may add topology, but never duplicate a required tree edge.
+  for (let my = minMY; my <= maxMY; my += 1) {
+    for (let mx = minMX; mx <= maxMX; mx += 1) {
+      if (loopAllowed(seed, mx, my, "x")) {
+        const [pa, pb] = canonicalPair(mx, my, mx + 1, my);
+        const pair = pa + "|" + pb;
+        if (!occupiedPairs.has(pair)) {
+          occupiedPairs.add(pair);
+          addEdge(edges, makeEdge(seed, mx, my, mx + 1, my, "loop"));
+        }
+      }
+      if (loopAllowed(seed, mx, my, "y")) {
+        const [pa, pb] = canonicalPair(mx, my, mx, my + 1);
+        const pair = pa + "|" + pb;
+        if (!occupiedPairs.has(pair)) {
+          occupiedPairs.add(pair);
+          addEdge(edges, makeEdge(seed, mx, my, mx, my + 1, "loop"));
+        }
+      }
     }
   }
 
@@ -291,11 +315,47 @@ function resolveLots(candidates, routeShapes) {
   const active = candidates.filter((candidate) => !candidateHitsTraversal(candidate, routeShapes));
   const losers = new Set();
 
+  // Spatial hashing changes only lookup cost. Conflict winners still depend
+  // solely on canonical priority, never insertion or exploration order.
+  const bucketSize = 320;
+  const buckets = new Map();
+  const bucketKey = (x, y) => x + "," + y;
+
+  for (let i = 0; i < active.length; i += 1) {
+    const box = expandAabb(active[i].aabb, LOT_CLEARANCE);
+    const minX = Math.floor(box.minX / bucketSize);
+    const maxX = Math.floor(box.maxX / bucketSize);
+    const minY = Math.floor(box.minY / bucketSize);
+    const maxY = Math.floor(box.maxY / bucketSize);
+    for (let by = minY; by <= maxY; by += 1) {
+      for (let bx = minX; bx <= maxX; bx += 1) {
+        const key = bucketKey(bx, by);
+        if (!buckets.has(key)) buckets.set(key, []);
+        buckets.get(key).push(i);
+      }
+    }
+  }
+
   for (let i = 0; i < active.length; i += 1) {
     const a = active[i];
-    for (let j = i + 1; j < active.length; j += 1) {
+    const box = expandAabb(a.aabb, LOT_CLEARANCE);
+    const minX = Math.floor(box.minX / bucketSize);
+    const maxX = Math.floor(box.maxX / bucketSize);
+    const minY = Math.floor(box.minY / bucketSize);
+    const maxY = Math.floor(box.maxY / bucketSize);
+    const neighbors = new Set();
+
+    for (let by = minY; by <= maxY; by += 1) {
+      for (let bx = minX; bx <= maxX; bx += 1) {
+        for (const j of buckets.get(bucketKey(bx, by)) ?? []) {
+          if (j > i) neighbors.add(j);
+        }
+      }
+    }
+
+    for (const j of neighbors) {
       const b = active[j];
-      if (!aabbIntersects(expandAabb(a.aabb, LOT_CLEARANCE), b.aabb)) continue;
+      if (!aabbIntersects(box, b.aabb)) continue;
       if (!obbOverlapStrict(a, b, LOT_CLEARANCE)) continue;
       if (comparePriority(a, b) < 0) losers.add(b.id);
       else losers.add(a.id);
