@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Deterministic Backrooms Map — Spatial Ownership</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <canvas id="map" aria-label="Procedural map"></canvas>
+
+  <section class="panel">
+    <div class="title">Spatial Ownership Map</div>
+    <div class="row">
+      <label for="seed">Seed</label>
+      <input id="seed" value="71-days-after-arrival" spellcheck="false">
+      <button id="apply">Apply</button>
+      <button id="random">Random</button>
+    </div>
+    <div class="row">
+      <button id="home">Home</button>
+      <button id="export">PNG</button>
+      <label class="check"><input id="debugRoutes" type="checkbox"> routes</label>
+      <label class="check"><input id="debugLots" type="checkbox"> ownership</label>
+      <label class="check"><input id="debugIds" type="checkbox"> ids</label>
+    </div>
+    <div id="stats" class="stats"></div>
+    <div class="help">Drag to pan · wheel to zoom · seed + camera are shareable in the URL</div>
+  </section>
+
+  <div class="badge">rooms are allocated only after required traversal space</div>
+  <script type="module" src="./src/app.js"></script>
+</body>
+</html>
