@@ -296,9 +296,22 @@ function incidentPortals(seed, mx, my) {
   return out;
 }
 
-function minProjectionSpan(poly) {
-  const b = polygonBounds(poly);
-  return Math.min(b.maxX - b.minX, b.maxY - b.minY);
+function projectionSpan(poly, angle) {
+  const ux = Math.cos(angle), uy = Math.sin(angle);
+  let lo = Infinity, hi = -Infinity;
+  for (const p of poly) {
+    const d = ux * p.x + uy * p.y;
+    lo = Math.min(lo, d); hi = Math.max(hi, d);
+  }
+  return hi - lo;
+}
+
+function partitionShapeOk(poly, baseAngle) {
+  const along = projectionSpan(poly, baseAngle);
+  const across = projectionSpan(poly, baseAngle + Math.PI / 2);
+  const short = Math.min(along, across);
+  const long = Math.max(along, across);
+  return short >= 44 && long / Math.max(1, short) <= 5.4;
 }
 
 function subdivideDistrict(seed, districtId, polygon, profile) {
@@ -326,25 +339,27 @@ function subdivideDistrict(seed, districtId, polygon, profile) {
     let split = null;
     for (let attempt = 0; attempt < 10; attempt += 1) {
       const mode = randInt(0, 99, seed, districtId, leaf.id, "split-mode", attempt);
+      const allowDiagonal = polygonArea(leaf.poly) > districtArea * 0.13;
       let wallAngle;
-      if (mode < 47) wallAngle = baseAngle;
-      else if (mode < 94) wallAngle = baseAngle + Math.PI / 2;
-      else if (mode < 97) wallAngle = baseAngle + Math.PI / 4;
-      else wallAngle = baseAngle - Math.PI / 4;
-      wallAngle += signed(mode < 94 ? 0.035 : 0.07, seed, districtId, leaf.id, "split-jitter", attempt);
+      if (mode < 49) wallAngle = baseAngle;
+      else if (mode < 98 || !allowDiagonal) wallAngle = baseAngle + Math.PI / 2;
+      else wallAngle = chance(0.5, seed, districtId, leaf.id, "diagonal-side", attempt)
+        ? baseAngle + Math.PI / 4
+        : baseAngle - Math.PI / 4;
+      wallAngle += signed(mode < 98 || !allowDiagonal ? 0.025 : 0.045, seed, districtId, leaf.id, "split-jitter", attempt);
       const nx = -Math.sin(wallAngle), ny = Math.cos(wallAngle);
       let lo = Infinity, hi = -Infinity;
       for (const p of leaf.poly) {
         const d = nx * p.x + ny * p.y;
         lo = Math.min(lo, d); hi = Math.max(hi, d);
       }
-      const ratio = randRange(0.39, 0.61, seed, districtId, leaf.id, "split-ratio", attempt);
+      const ratio = randRange(0.40, 0.60, seed, districtId, leaf.id, "split-ratio", attempt);
       const c = lo + (hi - lo) * ratio;
       const [a, b] = splitPolygon(leaf.poly, nx, ny, c);
       if (a.length < 3 || b.length < 3) continue;
       const aa = polygonArea(a), ba = polygonArea(b);
       if (aa < minArea || ba < minArea) continue;
-      if (minProjectionSpan(a) < 34 || minProjectionSpan(b) < 34) continue;
+      if (!partitionShapeOk(a, baseAngle) || !partitionShapeOk(b, baseAngle)) continue;
       split = [ensureCcw(a), ensureCcw(b)];
       break;
     }
