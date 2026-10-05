@@ -1,49 +1,241 @@
 import { chance, hashParts, hashString, rand01, randInt, randRange, signed } from "./prng.js";
-import { aabbIntersects, expandAabb, obb, obbOverlapStrict, rectsOverlapLocal } from "./geometry.js";
 
-export const GENERATOR_VERSION = 1;
-export const MACRO_SIZE = 1100;
-export const QUERY_INFLUENCE = 2100;
-export const CONFLICT_HALO = 620;
-export const LOT_CLEARANCE = 7;
+export const GENERATOR_VERSION = 2;
+export const DISTRICT_SIZE = 1050;
+export const DISTRICT_JITTER = 0.065;
+export const QUERY_MARGIN = DISTRICT_SIZE * 0.22;
+
+const EPS = 1e-7;
+const WALL_EPS = 1e-5;
 
 export const PALETTES = [
-  { floor: "#ead5a6", route: "#dfc78e", wall: "#8b7654" },
-  { floor: "#e5c98f", route: "#d9bb79", wall: "#87714c" },
-  { floor: "#e8d0b4", route: "#dbc1a0", wall: "#88715f" },
-  { floor: "#dbb59f", route: "#cfa38f", wall: "#805f55" },
-  { floor: "#b8c4cf", route: "#aeb9c3", wall: "#626f7b" },
-  { floor: "#bcc99c", route: "#afbd8d", wall: "#697252" },
-  { floor: "#d8b986", route: "#cdaa70", wall: "#7d6546" },
+  { floor: "#ead5a6", wall: "#877451" },
+  { floor: "#e4c98f", wall: "#806b49" },
+  { floor: "#e9d1b3", wall: "#88715f" },
+  { floor: "#ddb19f", wall: "#7e5d54" },
+  { floor: "#b7c4cf", wall: "#62717d" },
+  { floor: "#bdca9d", wall: "#697451" },
+  { floor: "#d9b985", wall: "#7d6545" },
 ];
 
 const PROFILES = [
-  { id: "office", spawn: 0.83, route: [30, 42], spacing: [120, 165], along: [88, 185], depth: [86, 180], maxLeaves: 6, palette: 0 },
-  { id: "service", spawn: 0.72, route: [24, 36], spacing: [115, 160], along: [70, 150], depth: [72, 150], maxLeaves: 4, palette: 1 },
-  { id: "institutional", spawn: 0.76, route: [34, 48], spacing: [145, 205], along: [115, 230], depth: [105, 220], maxLeaves: 7, palette: 2 },
-  { id: "liminal", spawn: 0.62, route: [38, 58], spacing: [170, 240], along: [150, 290], depth: [140, 280], maxLeaves: 3, palette: 0 },
-  { id: "archive", spawn: 0.88, route: [26, 38], spacing: [105, 145], along: [72, 135], depth: [95, 205], maxLeaves: 6, palette: 6 },
-  { id: "flooded", spawn: 0.66, route: [30, 44], spacing: [140, 210], along: [100, 220], depth: [100, 230], maxLeaves: 4, palette: 4 },
-  { id: "overgrown", spawn: 0.68, route: [30, 46], spacing: [135, 205], along: [100, 230], depth: [95, 240], maxLeaves: 5, palette: 5 },
+  { id: "office", cells: [48, 62], density: 0.64, merge: 0.38, maxMerge: 4, loops: 0.24, door: [20, 38], lobes: [2, 4] },
+  { id: "service", cells: [42, 58], density: 0.54, merge: 0.28, maxMerge: 3, loops: 0.18, door: [16, 30], lobes: [2, 4] },
+  { id: "institutional", cells: [36, 50], density: 0.61, merge: 0.46, maxMerge: 5, loops: 0.22, door: [22, 42], lobes: [2, 3] },
+  { id: "liminal", cells: [26, 38], density: 0.46, merge: 0.62, maxMerge: 7, loops: 0.15, door: [26, 52], lobes: [1, 3] },
+  { id: "archive", cells: [54, 70], density: 0.68, merge: 0.22, maxMerge: 3, loops: 0.28, door: [16, 28], lobes: [2, 4] },
+  { id: "flooded", cells: [32, 46], density: 0.54, merge: 0.54, maxMerge: 6, loops: 0.22, door: [24, 46], lobes: [1, 3] },
+  { id: "overgrown", cells: [38, 54], density: 0.57, merge: 0.48, maxMerge: 5, loops: 0.27, door: [22, 44], lobes: [2, 4] },
 ];
 
-function nodeKey(x, y) {
-  return x + "," + y;
-}
-
+function clamp(v, a, b) { return Math.max(a, Math.min(b, v)); }
+function key2(x, y) { return x + "," + y; }
 function canonicalPair(ax, ay, bx, by) {
-  const a = nodeKey(ax, ay);
-  const b = nodeKey(bx, by);
-  return a < b ? [a, b] : [b, a];
+  const a = key2(ax, ay), b = key2(bx, by);
+  return a < b ? a + "|" + b : b + "|" + a;
+}
+function sign(v) { return v < 0 ? -1 : v > 0 ? 1 : 0; }
+function dist2(a, b) { const dx = a.x - b.x, dy = a.y - b.y; return dx * dx + dy * dy; }
+
+function polygonAreaSigned(poly) {
+  let sum = 0;
+  for (let i = 0; i < poly.length; i += 1) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    sum += a.x * b.y - b.x * a.y;
+  }
+  return sum * 0.5;
+}
+export function polygonArea(poly) { return Math.abs(polygonAreaSigned(poly)); }
+
+function ensureCcw(poly) {
+  return polygonAreaSigned(poly) < 0 ? [...poly].reverse() : poly;
 }
 
-function edgeKey(ax, ay, bx, by, kind) {
-  const [a, b] = canonicalPair(ax, ay, bx, by);
-  return kind + ":" + a + "|" + b;
+function polygonCentroid(poly) {
+  const signed = polygonAreaSigned(poly);
+  if (Math.abs(signed) < EPS) {
+    const x = poly.reduce((s, p) => s + p.x, 0) / Math.max(1, poly.length);
+    const y = poly.reduce((s, p) => s + p.y, 0) / Math.max(1, poly.length);
+    return { x, y };
+  }
+  let cx = 0, cy = 0;
+  for (let i = 0; i < poly.length; i += 1) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const cross = a.x * b.y - b.x * a.y;
+    cx += (a.x + b.x) * cross;
+    cy += (a.y + b.y) * cross;
+  }
+  const factor = 1 / (6 * signed);
+  return { x: cx * factor, y: cy * factor };
 }
 
-function sign(v) {
-  return v < 0 ? -1 : v > 0 ? 1 : 0;
+function polygonBounds(poly) {
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const p of poly) {
+    minX = Math.min(minX, p.x); minY = Math.min(minY, p.y);
+    maxX = Math.max(maxX, p.x); maxY = Math.max(maxY, p.y);
+  }
+  return { minX, minY, maxX, maxY };
+}
+
+function boundsIntersect(a, b) {
+  return !(a.maxX < b.minX || a.minX > b.maxX || a.maxY < b.minY || a.minY > b.maxY);
+}
+
+function dedupePolygon(poly) {
+  const out = [];
+  for (const p of poly) {
+    const prev = out[out.length - 1];
+    if (!prev || Math.hypot(prev.x - p.x, prev.y - p.y) > 1e-6) out.push(p);
+  }
+  if (out.length > 2 && Math.hypot(out[0].x - out[out.length - 1].x, out[0].y - out[out.length - 1].y) < 1e-6) out.pop();
+  return out;
+}
+
+function clipHalfPlane(poly, nx, ny, c, keepLess) {
+  if (!poly.length) return [];
+  const out = [];
+  const inside = (p) => keepLess ? nx * p.x + ny * p.y <= c + EPS : nx * p.x + ny * p.y >= c - EPS;
+  for (let i = 0; i < poly.length; i += 1) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const ia = inside(a), ib = inside(b);
+    const da = nx * a.x + ny * a.y - c;
+    const db = nx * b.x + ny * b.y - c;
+    if (ia) out.push(a);
+    if (ia !== ib) {
+      const denom = da - db;
+      if (Math.abs(denom) > EPS) {
+        const t = da / denom;
+        out.push({ x: a.x + (b.x - a.x) * t, y: a.y + (b.y - a.y) * t });
+      }
+    }
+  }
+  return dedupePolygon(out);
+}
+
+function splitPolygon(poly, nx, ny, c) {
+  return [clipHalfPlane(poly, nx, ny, c, true), clipHalfPlane(poly, nx, ny, c, false)];
+}
+
+function pointInConvex(poly, point) {
+  let last = 0;
+  for (let i = 0; i < poly.length; i += 1) {
+    const a = poly[i], b = poly[(i + 1) % poly.length];
+    const cross = (b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x);
+    if (Math.abs(cross) < 1e-5) continue;
+    const s = Math.sign(cross);
+    if (last && s !== last) return false;
+    last = s;
+  }
+  return true;
+}
+
+function pointLineDistance(p, a, b) {
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.hypot(dx, dy);
+  if (len < EPS) return Math.hypot(p.x - a.x, p.y - a.y);
+  return Math.abs((p.x - a.x) * dy - (p.y - a.y) * dx) / len;
+}
+
+function sharedSegment(a1, a2, b1, b2) {
+  const adx = a2.x - a1.x, ady = a2.y - a1.y;
+  const alen = Math.hypot(adx, ady);
+  if (alen < EPS) return null;
+  if (pointLineDistance(b1, a1, a2) > WALL_EPS || pointLineDistance(b2, a1, a2) > WALL_EPS) return null;
+
+  const ux = adx / alen, uy = ady / alen;
+  const proj = (p) => (p.x - a1.x) * ux + (p.y - a1.y) * uy;
+  const b0 = proj(b1), b1p = proj(b2);
+  const lo = Math.max(0, Math.min(b0, b1p));
+  const hi = Math.min(alen, Math.max(b0, b1p));
+  if (hi - lo <= 1e-5) return null;
+  return {
+    p1: { x: a1.x + ux * lo, y: a1.y + uy * lo },
+    p2: { x: a1.x + ux * hi, y: a1.y + uy * hi },
+    length: hi - lo,
+  };
+}
+
+function longestSharedBoundary(polyA, polyB) {
+  let best = null;
+  for (let i = 0; i < polyA.length; i += 1) {
+    const a1 = polyA[i], a2 = polyA[(i + 1) % polyA.length];
+    for (let j = 0; j < polyB.length; j += 1) {
+      const b1 = polyB[j], b2 = polyB[(j + 1) % polyB.length];
+      const overlap = sharedSegment(a1, a2, b1, b2);
+      if (overlap && (!best || overlap.length > best.length)) best = overlap;
+    }
+  }
+  return best;
+}
+
+function clipConvex(subject, clipper) {
+  let out = ensureCcw(subject);
+  const clip = ensureCcw(clipper);
+  for (let i = 0; i < clip.length && out.length; i += 1) {
+    const a = clip[i], b = clip[(i + 1) % clip.length];
+    const dx = b.x - a.x, dy = b.y - a.y;
+    // CCW polygon interior lies left of every directed edge: dy*x - dx*y <= dy*a.x - dx*a.y
+    const nx = dy, ny = -dx, c = nx * a.x + ny * a.y;
+    out = clipHalfPlane(out, nx, ny, c, true);
+  }
+  return out;
+}
+
+export function convexIntersectionArea(a, b) {
+  const clipped = clipConvex(a, b);
+  return clipped.length >= 3 ? polygonArea(clipped) : 0;
+}
+
+function warpedVertex(seed, vx, vy) {
+  const jitter = DISTRICT_SIZE * DISTRICT_JITTER;
+  return {
+    x: vx * DISTRICT_SIZE + signed(jitter, seed, "vertex-x", vx, vy),
+    y: vy * DISTRICT_SIZE + signed(jitter, seed, "vertex-y", vx, vy),
+  };
+}
+
+function districtPolygon(seed, mx, my) {
+  return ensureCcw([
+    warpedVertex(seed, mx, my),
+    warpedVertex(seed, mx + 1, my),
+    warpedVertex(seed, mx + 1, my + 1),
+    warpedVertex(seed, mx, my + 1),
+  ]);
+}
+
+function districtBoundaryEdges(seed, mx, my) {
+  const p = districtPolygon(seed, mx, my);
+  return {
+    top: [p[0], p[1]],
+    right: [p[1], p[2]],
+    bottom: [p[2], p[3]],
+    left: [p[3], p[0]],
+  };
+}
+
+function profileFor(seed, mx, my) {
+  const zx = Math.floor(mx / 2), zy = Math.floor(my / 2);
+  let index = randInt(0, PROFILES.length - 1, seed, "profile-zone", zx, zy);
+  if (chance(0.18, seed, "profile-mutation", mx, my)) index = randInt(0, PROFILES.length - 1, seed, "profile", mx, my);
+  return PROFILES[index];
+}
+
+function paletteFor(seed, mx, my) {
+  const zx = Math.floor(mx / 3), zy = Math.floor(my / 3);
+  const rare = rand01(seed, "palette-zone-rare", zx, zy);
+  if (rare < 0.82) return randInt(0, 2, seed, "palette-zone-common", zx, zy);
+  return randInt(3, PALETTES.length - 1, seed, "palette-zone-color", zx, zy);
+}
+
+function parentFor(seed, mx, my) {
+  if (mx === 0 && my === 0) return null;
+  if (mx === 0) return [0, my - sign(my)];
+  if (my === 0) return [mx - sign(mx), 0];
+  const ax = Math.abs(mx), ay = Math.abs(my);
+  if (ax > ay) return [mx - sign(mx), my];
+  if (ay > ax) return [mx, my - sign(my)];
+  return chance(0.5, seed, "parent-axis", mx, my) ? [mx - sign(mx), my] : [mx, my - sign(my)];
 }
 
 export function parentCell(seedText, mx, my) {
@@ -51,504 +243,654 @@ export function parentCell(seedText, mx, my) {
   return parentFor(seed, mx, my);
 }
 
-function parentFor(seed, mx, my) {
-  if (mx === 0 && my === 0) return null;
-  if (mx === 0) return [0, my - sign(my)];
-  if (my === 0) return [mx - sign(mx), 0];
-
-  const chooseX = chance(0.5, seed, "parent-axis", mx, my);
-  if (chooseX) return [mx - sign(mx), my];
-  return [mx, my - sign(my)];
+function isParentLink(seed, ax, ay, bx, by) {
+  const pa = parentFor(seed, ax, ay);
+  if (pa && pa[0] === bx && pa[1] === by) return true;
+  const pb = parentFor(seed, bx, by);
+  return Boolean(pb && pb[0] === ax && pb[1] === ay);
 }
 
-function macroNode(seed, mx, my) {
-  const jitter = MACRO_SIZE * 0.31;
+function activeEdge(seed, ax, ay, bx, by) {
+  if (Math.abs(ax - bx) + Math.abs(ay - by) !== 1) return false;
+  if (isParentLink(seed, ax, ay, bx, by)) return true;
+  return chance(0.09, seed, "optional-edge", canonicalPair(ax, ay, bx, by));
+}
+
+function canonicalBoundary(seed, ax, ay, bx, by) {
+  if (ay === by) {
+    const gx = Math.max(ax, bx), gy = ay;
+    return [warpedVertex(seed, gx, gy), warpedVertex(seed, gx, gy + 1)];
+  }
+  const gx = ax, gy = Math.max(ay, by);
+  return [warpedVertex(seed, gx, gy), warpedVertex(seed, gx + 1, gy)];
+}
+
+function portalFor(seed, ax, ay, bx, by) {
+  const pair = canonicalPair(ax, ay, bx, by);
+  const [a, b] = canonicalBoundary(seed, ax, ay, bx, by);
+  const length = Math.hypot(b.x - a.x, b.y - a.y);
+  const width = Math.min(randRange(34, 70, seed, "portal-width", pair), length * 0.16);
+  const halfT = width / (2 * length);
+  const t = clamp(randRange(0.24, 0.84, seed, "portal-position", pair), halfT + 0.04, 1 - halfT - 0.04);
+  const interp = (tt) => ({ x: a.x + (b.x - a.x) * tt, y: a.y + (b.y - a.y) * tt });
   return {
-    mx,
-    my,
-    x: mx * MACRO_SIZE + MACRO_SIZE * 0.5 + signed(jitter, seed, "node-x", mx, my),
-    y: my * MACRO_SIZE + MACRO_SIZE * 0.5 + signed(jitter, seed, "node-y", mx, my),
+    id: "portal:" + pair,
+    pair,
+    neighbor: ax === bx ? [bx, by] : [bx, by],
+    center: interp(t),
+    p1: interp(t - halfT),
+    p2: interp(t + halfT),
+    width,
   };
 }
 
-function profileFor(seed, key) {
-  return PROFILES[randInt(0, PROFILES.length - 1, seed, "profile", key)];
-}
-
-function makeEdge(seed, ax, ay, bx, by, kind) {
-  const key = edgeKey(ax, ay, bx, by, kind);
-  const a = macroNode(seed, ax, ay);
-  const b = macroNode(seed, bx, by);
-  const profile = profileFor(seed, key);
-  const width = randRange(profile.route[0], profile.route[1], seed, key, "route-width");
-
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const length = Math.hypot(dx, dy) || 1;
-  const nx = -dy / length;
-  const ny = dx / length;
-  const bendA = signed(MACRO_SIZE * 0.16, seed, key, "bend-a");
-  const bendB = signed(MACRO_SIZE * 0.16, seed, key, "bend-b");
-  const tangentA = signed(MACRO_SIZE * 0.045, seed, key, "tangent-a");
-  const tangentB = signed(MACRO_SIZE * 0.045, seed, key, "tangent-b");
-
-  const points = [
-    { x: a.x, y: a.y },
-    {
-      x: a.x + dx * 0.34 + (dx / length) * tangentA + nx * bendA,
-      y: a.y + dy * 0.34 + (dy / length) * tangentA + ny * bendA,
-    },
-    {
-      x: a.x + dx * 0.67 + (dx / length) * tangentB + nx * bendB,
-      y: a.y + dy * 0.67 + (dy / length) * tangentB + ny * bendB,
-    },
-    { x: b.x, y: b.y },
-  ];
-
-  const segments = [];
-  for (let i = 0; i < points.length - 1; i += 1) {
-    const p = points[i];
-    const q = points[i + 1];
-    const sx = q.x - p.x;
-    const sy = q.y - p.y;
-    const len = Math.hypot(sx, sy);
-    const angle = Math.atan2(sy, sx);
-    segments.push(obb(
-      (p.x + q.x) / 2,
-      (p.y + q.y) / 2,
-      len + width * 0.72,
-      width,
-      angle,
-      {
-        id: key + ":segment:" + i,
-        edgeKey: key,
-        edgeKind: kind,
-        segmentIndex: i,
-        profileId: profile.id,
-        palette: profile.palette,
-        routeWidth: width,
-        ax: p.x,
-        ay: p.y,
-        bx: q.x,
-        by: q.y,
-        length: len,
-      },
-    ));
-  }
-
-  const chambers = [];
-  const chamberSizeA = width * randRange(1.45, 2.25, seed, key, "chamber-a");
-  const chamberSizeB = width * randRange(1.45, 2.25, seed, key, "chamber-b");
-  chambers.push(obb(a.x, a.y, chamberSizeA, chamberSizeA, 0, {
-    id: key + ":node:a",
-    edgeKey: key,
-    edgeKind: kind,
-    profileId: profile.id,
-    palette: profile.palette,
-    routeWidth: width,
-  }));
-  chambers.push(obb(b.x, b.y, chamberSizeB, chamberSizeB, 0, {
-    id: key + ":node:b",
-    edgeKey: key,
-    edgeKind: kind,
-    profileId: profile.id,
-    palette: profile.palette,
-    routeWidth: width,
-  }));
-
-  if (chance(0.34, seed, key, "mid-chamber")) {
-    const segment = segments[randInt(0, segments.length - 1, seed, key, "mid-segment")];
-    const t = randRange(0.30, 0.70, seed, key, "mid-t");
-    const x = segment.ax + (segment.bx - segment.ax) * t;
-    const y = segment.ay + (segment.by - segment.ay) * t;
-    const along = randRange(width * 1.7, width * 3.3, seed, key, "mid-along");
-    const cross = randRange(width * 1.5, width * 2.8, seed, key, "mid-cross");
-    chambers.push(obb(x, y, along, cross, segment.angle, {
-      id: key + ":chamber:mid",
-      edgeKey: key,
-      edgeKind: kind,
-      profileId: profile.id,
-      palette: profile.palette,
-      routeWidth: width,
-    }));
-  }
-
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-  for (const shape of [...segments, ...chambers]) {
-    minX = Math.min(minX, shape.aabb.minX);
-    minY = Math.min(minY, shape.aabb.minY);
-    maxX = Math.max(maxX, shape.aabb.maxX);
-    maxY = Math.max(maxY, shape.aabb.maxY);
-  }
-
-  return { key, kind, a, b, profile, width, points, segments, chambers, aabb: { minX, minY, maxX, maxY } };
-}
-
-function addEdge(map, edge) {
-  if (!map.has(edge.key)) map.set(edge.key, edge);
-}
-
-function loopAllowed(seed, mx, my, axis) {
-  const probability = axis === "x" ? 0.12 : 0.10;
-  return chance(probability, seed, "loop", mx, my, axis);
-}
-
-function collectEdges(seed, bounds) {
-  const search = expandAabb(bounds, QUERY_INFLUENCE);
-  const minMX = Math.floor(search.minX / MACRO_SIZE) - 2;
-  const maxMX = Math.floor(search.maxX / MACRO_SIZE) + 2;
-  const minMY = Math.floor(search.minY / MACRO_SIZE) - 2;
-  const maxMY = Math.floor(search.maxY / MACRO_SIZE) + 2;
-  const edges = new Map();
-  const occupiedPairs = new Set();
-
-  // Required tree obligations are established first.
-  for (let my = minMY; my <= maxMY; my += 1) {
-    for (let mx = minMX; mx <= maxMX; mx += 1) {
-      const parent = parentFor(seed, mx, my);
-      if (!parent) continue;
-      const [pa, pb] = canonicalPair(mx, my, parent[0], parent[1]);
-      occupiedPairs.add(pa + "|" + pb);
-      addEdge(edges, makeEdge(seed, mx, my, parent[0], parent[1], "tree"));
-    }
-  }
-
-  // Optional loops may add topology, but never duplicate a required tree edge.
-  for (let my = minMY; my <= maxMY; my += 1) {
-    for (let mx = minMX; mx <= maxMX; mx += 1) {
-      if (loopAllowed(seed, mx, my, "x")) {
-        const [pa, pb] = canonicalPair(mx, my, mx + 1, my);
-        const pair = pa + "|" + pb;
-        if (!occupiedPairs.has(pair)) {
-          occupiedPairs.add(pair);
-          addEdge(edges, makeEdge(seed, mx, my, mx + 1, my, "loop"));
-        }
-      }
-      if (loopAllowed(seed, mx, my, "y")) {
-        const [pa, pb] = canonicalPair(mx, my, mx, my + 1);
-        const pair = pa + "|" + pb;
-        if (!occupiedPairs.has(pair)) {
-          occupiedPairs.add(pair);
-          addEdge(edges, makeEdge(seed, mx, my, mx, my + 1, "loop"));
-        }
-      }
-    }
-  }
-
-  return [...edges.values()].filter((edge) => aabbIntersects(edge.aabb, search));
-}
-
-function candidateFromSample(seed, edge, segment, sampleIndex, sampleCount, side) {
-  const profile = edge.profile;
-  const baseT = (sampleIndex + 1) / (sampleCount + 1);
-  const jitter = signed(0.16 / Math.max(1, sampleCount), seed, edge.key, segment.segmentIndex, sampleIndex, side, "t-jitter");
-  const t = Math.max(0.08, Math.min(0.92, baseT + jitter));
-  const px = segment.ax + (segment.bx - segment.ax) * t;
-  const py = segment.ay + (segment.by - segment.ay) * t;
-
-  const along = randRange(profile.along[0], profile.along[1], seed, edge.key, segment.segmentIndex, sampleIndex, side, "along");
-  const depth = randRange(profile.depth[0], profile.depth[1], seed, edge.key, segment.segmentIndex, sampleIndex, side, "depth");
-
-  const nx = -Math.sin(segment.angle);
-  const ny = Math.cos(segment.angle);
-  const offset = edge.width / 2 + depth / 2 + LOT_CLEARANCE;
-  const x = px + nx * side * offset;
-  const y = py + ny * side * offset;
-  const id = edge.key + ":lot:" + segment.segmentIndex + ":" + sampleIndex + ":" + side;
-  const priority = hashParts(seed, "lot-priority", id);
-
-  const envelope = obb(x, y, along, depth, segment.angle, {
-    id,
-    priority,
-    sourceSegmentId: segment.id,
-    sourceEdgeKey: edge.key,
-    edgeKind: edge.kind,
-    profileId: profile.id,
-    palette: profile.palette,
-    doorSide: side > 0 ? -1 : 1,
-  });
-
-  return {
-    ...envelope,
-    id,
-    priority,
-    sourceSegmentId: segment.id,
-    sourceEdgeKey: edge.key,
-    edgeKind: edge.kind,
-    profile,
-    palette: profile.palette,
-    doorSide: side > 0 ? -1 : 1,
-  };
-}
-
-function candidatesForEdge(seed, edge) {
+function incidentPortals(seed, mx, my) {
   const out = [];
-  for (const segment of edge.segments) {
-    const spacing = randRange(edge.profile.spacing[0], edge.profile.spacing[1], seed, edge.key, segment.segmentIndex, "spacing");
-    const sampleCount = Math.max(1, Math.floor(segment.length / spacing));
-    for (let i = 0; i < sampleCount; i += 1) {
-      for (const side of [-1, 1]) {
-        const probability = edge.profile.spawn * (edge.kind === "tree" ? 1 : 0.72);
-        if (!chance(probability, seed, edge.key, segment.segmentIndex, i, side, "spawn")) continue;
-        out.push(candidateFromSample(seed, edge, segment, i, sampleCount, side));
+  const dirs = [[1,0],[0,1],[-1,0],[0,-1]];
+  for (const [dx, dy] of dirs) {
+    const nx = mx + dx, ny = my + dy;
+    if (!activeEdge(seed, mx, my, nx, ny)) continue;
+    out.push({ ...portalFor(seed, mx, my, nx, ny), nx, ny, required: isParentLink(seed, mx, my, nx, ny) });
+  }
+  out.sort((a, b) => a.id.localeCompare(b.id));
+  return out;
+}
+
+function minProjectionSpan(poly) {
+  const b = polygonBounds(poly);
+  return Math.min(b.maxX - b.minX, b.maxY - b.minY);
+}
+
+function subdivideDistrict(seed, districtId, polygon, profile) {
+  const target = randInt(profile.cells[0], profile.cells[1], seed, districtId, "cell-count");
+  const districtArea = polygonArea(polygon);
+  const minArea = districtArea / (target * 3.1);
+  const top = { x: polygon[1].x - polygon[0].x, y: polygon[1].y - polygon[0].y };
+  const baseAngle = Math.atan2(top.y, top.x) + signed(0.14, seed, districtId, "orientation");
+  const leaves = [{ id: districtId + ":cell:0", poly: polygon }];
+  let serial = 1;
+  let guard = 0;
+
+  while (leaves.length < target && guard++ < target * 10) {
+    let pickIndex = -1;
+    let best = -Infinity;
+    for (let i = 0; i < leaves.length; i += 1) {
+      const area = polygonArea(leaves[i].poly);
+      if (area < minArea * 2.15) continue;
+      const score = area * (0.94 + rand01(seed, districtId, "pick", guard, leaves[i].id) * 0.12);
+      if (score > best) { best = score; pickIndex = i; }
+    }
+    if (pickIndex < 0) break;
+
+    const leaf = leaves[pickIndex];
+    let split = null;
+    for (let attempt = 0; attempt < 10; attempt += 1) {
+      const mode = randInt(0, 99, seed, districtId, leaf.id, "split-mode", attempt);
+      let wallAngle;
+      if (mode < 47) wallAngle = baseAngle;
+      else if (mode < 94) wallAngle = baseAngle + Math.PI / 2;
+      else if (mode < 97) wallAngle = baseAngle + Math.PI / 4;
+      else wallAngle = baseAngle - Math.PI / 4;
+      wallAngle += signed(mode < 94 ? 0.035 : 0.07, seed, districtId, leaf.id, "split-jitter", attempt);
+      const nx = -Math.sin(wallAngle), ny = Math.cos(wallAngle);
+      let lo = Infinity, hi = -Infinity;
+      for (const p of leaf.poly) {
+        const d = nx * p.x + ny * p.y;
+        lo = Math.min(lo, d); hi = Math.max(hi, d);
       }
+      const ratio = randRange(0.39, 0.61, seed, districtId, leaf.id, "split-ratio", attempt);
+      const c = lo + (hi - lo) * ratio;
+      const [a, b] = splitPolygon(leaf.poly, nx, ny, c);
+      if (a.length < 3 || b.length < 3) continue;
+      const aa = polygonArea(a), ba = polygonArea(b);
+      if (aa < minArea || ba < minArea) continue;
+      if (minProjectionSpan(a) < 34 || minProjectionSpan(b) < 34) continue;
+      split = [ensureCcw(a), ensureCcw(b)];
+      break;
+    }
+
+    if (!split) {
+      // Mark this leaf effectively unsplittable by reducing its selection area.
+      leaf.locked = true;
+      if (leaves.every((x) => x.locked || polygonArea(x.poly) < minArea * 2.15)) break;
+      continue;
+    }
+
+    leaves.splice(pickIndex, 1,
+      { id: districtId + ":cell:" + serial++, poly: split[0] },
+      { id: districtId + ":cell:" + serial++, poly: split[1] },
+    );
+  }
+
+  return leaves.map((leaf, index) => ({
+    ...leaf,
+    index,
+    area: polygonArea(leaf.poly),
+    centroid: polygonCentroid(leaf.poly),
+    bounds: polygonBounds(leaf.poly),
+  }));
+}
+
+function buildAdjacency(cells) {
+  const edges = [];
+  const neighbors = Array.from({ length: cells.length }, () => []);
+  for (let i = 0; i < cells.length; i += 1) {
+    for (let j = i + 1; j < cells.length; j += 1) {
+      if (!boundsIntersect(cells[i].bounds, cells[j].bounds)) continue;
+      const shared = longestSharedBoundary(cells[i].poly, cells[j].poly);
+      if (!shared || shared.length < 1e-4) continue;
+      const edge = {
+        id: cells[i].id < cells[j].id ? cells[i].id + "|" + cells[j].id : cells[j].id + "|" + cells[i].id,
+        a: i,
+        b: j,
+        p1: shared.p1,
+        p2: shared.p2,
+        length: shared.length,
+      };
+      const index = edges.length;
+      edges.push(edge);
+      neighbors[i].push({ cell: j, edge: index });
+      neighbors[j].push({ cell: i, edge: index });
+    }
+  }
+  return { edges, neighbors };
+}
+
+function boundaryEdgeOverlap(cell, districtPoly) {
+  const out = [];
+  for (let i = 0; i < cell.poly.length; i += 1) {
+    const a1 = cell.poly[i], a2 = cell.poly[(i + 1) % cell.poly.length];
+    for (let j = 0; j < districtPoly.length; j += 1) {
+      const b1 = districtPoly[j], b2 = districtPoly[(j + 1) % districtPoly.length];
+      const overlap = sharedSegment(a1, a2, b1, b2);
+      if (overlap) out.push({ ...overlap, cellEdge: i, districtEdge: j });
     }
   }
   return out;
 }
 
-function comparePriority(a, b) {
-  if (a.priority !== b.priority) return a.priority - b.priority;
-  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
-}
-
-function candidateHitsTraversal(candidate, routeShapes) {
-  for (const shape of routeShapes) {
-    if (shape.id === candidate.sourceSegmentId) continue;
-    if (!aabbIntersects(candidate.aabb, shape.aabb)) continue;
-    if (obbOverlapStrict(candidate, shape, 1.5)) return true;
-  }
-  return false;
-}
-
-function resolveLots(candidates, routeShapes) {
-  const active = candidates.filter((candidate) => !candidateHitsTraversal(candidate, routeShapes));
-  const losers = new Set();
-
-  // Spatial hashing changes only lookup cost. Conflict winners still depend
-  // solely on canonical priority, never insertion or exploration order.
-  const bucketSize = 320;
-  const buckets = new Map();
-  const bucketKey = (x, y) => x + "," + y;
-
-  for (let i = 0; i < active.length; i += 1) {
-    const box = expandAabb(active[i].aabb, LOT_CLEARANCE);
-    const minX = Math.floor(box.minX / bucketSize);
-    const maxX = Math.floor(box.maxX / bucketSize);
-    const minY = Math.floor(box.minY / bucketSize);
-    const maxY = Math.floor(box.maxY / bucketSize);
-    for (let by = minY; by <= maxY; by += 1) {
-      for (let bx = minX; bx <= maxX; bx += 1) {
-        const key = bucketKey(bx, by);
-        if (!buckets.has(key)) buckets.set(key, []);
-        buckets.get(key).push(i);
+function portalCells(cells, portals) {
+  const map = new Map();
+  for (const portal of portals) {
+    const hits = [];
+    for (const cell of cells) {
+      let matched = false;
+      for (let i = 0; i < cell.poly.length && !matched; i += 1) {
+        const a = cell.poly[i], b = cell.poly[(i + 1) % cell.poly.length];
+        const overlap = sharedSegment(a, b, portal.p1, portal.p2);
+        if (overlap && overlap.length > 0.5) matched = true;
       }
+      if (matched) hits.push(cell.index);
     }
-  }
-
-  for (let i = 0; i < active.length; i += 1) {
-    const a = active[i];
-    const box = expandAabb(a.aabb, LOT_CLEARANCE);
-    const minX = Math.floor(box.minX / bucketSize);
-    const maxX = Math.floor(box.maxX / bucketSize);
-    const minY = Math.floor(box.minY / bucketSize);
-    const maxY = Math.floor(box.maxY / bucketSize);
-    const neighbors = new Set();
-
-    for (let by = minY; by <= maxY; by += 1) {
-      for (let bx = minX; bx <= maxX; bx += 1) {
-        for (const j of buckets.get(bucketKey(bx, by)) ?? []) {
-          if (j > i) neighbors.add(j);
+    if (!hits.length) {
+      // Numerical fallback: pick the polygon containing the portal center, then nearest centroid.
+      let index = cells.findIndex((cell) => pointInConvex(cell.poly, portal.center));
+      if (index < 0) {
+        let best = Infinity;
+        for (const cell of cells) {
+          const d = dist2(cell.centroid, portal.center);
+          if (d < best) { best = d; index = cell.index; }
         }
       }
+      hits.push(index);
     }
+    map.set(portal.id, [...new Set(hits)]);
+  }
+  return map;
+}
 
-    for (const j of neighbors) {
-      const b = active[j];
-      if (!aabbIntersects(box, b.aabb)) continue;
-      if (!obbOverlapStrict(a, b, LOT_CLEARANCE)) continue;
-      if (comparePriority(a, b) < 0) losers.add(b.id);
-      else losers.add(a.id);
+function shortestPath(seed, districtId, cells, neighbors, source, target) {
+  if (source === target) return [source];
+  const n = cells.length;
+  const dist = new Array(n).fill(Infinity);
+  const prev = new Array(n).fill(-1);
+  const used = new Array(n).fill(false);
+  dist[source] = 0;
+
+  for (let step = 0; step < n; step += 1) {
+    let u = -1, best = Infinity;
+    for (let i = 0; i < n; i += 1) {
+      if (!used[i] && dist[i] < best) { best = dist[i]; u = i; }
+    }
+    if (u < 0 || u === target) break;
+    used[u] = true;
+    for (const item of neighbors[u]) {
+      const v = item.cell;
+      const areaBias = 0.22 * (1 - clamp(cells[v].area / (DISTRICT_SIZE * DISTRICT_SIZE * 0.04), 0, 1));
+      const jitter = rand01(seed, districtId, "path-cost", cells[u].id, cells[v].id) * 0.18;
+      const nd = dist[u] + 1 + areaBias + jitter;
+      if (nd < dist[v] - 1e-9) { dist[v] = nd; prev[v] = u; }
     }
   }
 
-  return active.filter((candidate) => !losers.has(candidate.id));
+  if (!Number.isFinite(dist[target])) return [];
+  const path = [];
+  for (let cur = target; cur >= 0; cur = prev[cur]) {
+    path.push(cur);
+    if (cur === source) break;
+  }
+  return path.reverse();
 }
 
-function localRect(x, y, w, h) {
-  return { x, y, w, h };
+function chooseLobeAnchors(seed, districtId, cells, boundarySet, count) {
+  const candidates = cells
+    .filter((cell) => !boundarySet.has(cell.index))
+    .sort((a, b) => {
+      const sa = rand01(seed, districtId, "lobe-rank", a.id) + clamp(a.area / 80000, 0, 0.35);
+      const sb = rand01(seed, districtId, "lobe-rank", b.id) + clamp(b.area / 80000, 0, 0.35);
+      return sb - sa || a.id.localeCompare(b.id);
+    });
+  const chosen = [];
+  for (const candidate of candidates) {
+    if (chosen.length >= count) break;
+    if (chosen.every((other) => Math.hypot(candidate.centroid.x - other.centroid.x, candidate.centroid.y - other.centroid.y) > DISTRICT_SIZE * 0.22)) {
+      chosen.push(candidate);
+    }
+  }
+  return chosen.map((x) => x.index);
 }
 
-function subdivideLot(seed, lot) {
-  const minDim = 36;
-  const maxLeaves = lot.profile.maxLeaves;
-  const desired = randInt(1, maxLeaves, seed, lot.id, "leaf-count");
-  const leaves = [localRect(-lot.w / 2, -lot.h / 2, lot.w, lot.h)];
-  const walls = [];
+function chooseActiveCells(seed, districtId, cells, adjacency, profile, portals, portalMap, districtPoly) {
+  const active = new Set();
+  const forced = new Set();
+  for (const ids of portalMap.values()) for (const id of ids) { active.add(id); forced.add(id); }
 
-  let guard = 0;
-  while (leaves.length < desired && guard++ < 24) {
-    let pickIndex = -1;
-    let bestScore = -Infinity;
+  const required = [...forced].sort((a, b) => cells[a].id.localeCompare(cells[b].id));
+  const boundarySet = new Set();
+  for (const cell of cells) if (boundaryEdgeOverlap(cell, districtPoly).length) boundarySet.add(cell.index);
 
-    for (let i = 0; i < leaves.length; i += 1) {
-      const r = leaves[i];
-      const canVertical = r.w >= minDim * 2.15;
-      const canHorizontal = r.h >= minDim * 2.15;
-      if (!canVertical && !canHorizontal) continue;
-      const score = r.w * r.h + rand01(seed, lot.id, "pick", guard, i) * 0.001;
-      if (score > bestScore) {
-        bestScore = score;
-        pickIndex = i;
-      }
+  let root = required[0] ?? 0;
+  active.add(root);
+  for (const target of required.slice(1)) {
+    for (const cell of shortestPath(seed, districtId, cells, adjacency.neighbors, root, target)) active.add(cell);
+  }
+
+  const lobeCount = randInt(profile.lobes[0], profile.lobes[1], seed, districtId, "lobe-count");
+  for (const anchor of chooseLobeAnchors(seed, districtId, cells, boundarySet, lobeCount)) {
+    for (const cell of shortestPath(seed, districtId, cells, adjacency.neighbors, root, anchor)) active.add(cell);
+  }
+
+  const density = clamp(profile.density + signed(0.11, seed, districtId, "density"), 0.34, 0.78);
+  const targetCount = Math.max(active.size, Math.round(cells.length * density));
+
+  while (active.size < targetCount) {
+    let chosen = -1;
+    let bestScore = Infinity;
+    for (const cell of cells) {
+      if (active.has(cell.index)) continue;
+      let activeNeighbors = 0;
+      for (const n of adjacency.neighbors[cell.index]) if (active.has(n.cell)) activeNeighbors += 1;
+      if (!activeNeighbors) continue;
+      const boundaryPenalty = boundarySet.has(cell.index) && !forced.has(cell.index) ? 1.4 : 0;
+      const compactBonus = -0.19 * activeNeighbors;
+      const score = rand01(seed, districtId, "growth", cell.id) + boundaryPenalty + compactBonus;
+      if (score < bestScore) { bestScore = score; chosen = cell.index; }
     }
+    if (chosen < 0) break;
+    active.add(chosen);
+  }
 
-    if (pickIndex < 0) break;
-    const r = leaves[pickIndex];
-    const verticalPossible = r.w >= minDim * 2.15;
-    const horizontalPossible = r.h >= minDim * 2.15;
-    let vertical;
-    if (verticalPossible && horizontalPossible) {
-      if (r.w > r.h * 1.18) vertical = true;
-      else if (r.h > r.w * 1.18) vertical = false;
-      else vertical = chance(0.5, seed, lot.id, "axis", guard);
-    } else {
-      vertical = verticalPossible;
-    }
+  return { active, forced, boundarySet, density };
+}
 
-    const ratio = randRange(0.36, 0.64, seed, lot.id, "ratio", guard);
-    if (vertical) {
-      const split = r.w * ratio;
-      if (split < minDim || r.w - split < minDim) break;
-      const a = localRect(r.x, r.y, split, r.h);
-      const b = localRect(r.x + split, r.y, r.w - split, r.h);
-      leaves.splice(pickIndex, 1, a, b);
-      walls.push({
-        x1: r.x + split, y1: r.y,
-        x2: r.x + split, y2: r.y + r.h,
-        gapT: randRange(0.28, 0.72, seed, lot.id, "gap-t", guard),
-        gapWidth: randRange(15, Math.min(34, r.h * 0.34), seed, lot.id, "gap-w", guard),
-      });
-    } else {
-      const split = r.h * ratio;
-      if (split < minDim || r.h - split < minDim) break;
-      const a = localRect(r.x, r.y, r.w, split);
-      const b = localRect(r.x, r.y + split, r.w, r.h - split);
-      leaves.splice(pickIndex, 1, a, b);
-      walls.push({
-        x1: r.x, y1: r.y + split,
-        x2: r.x + r.w, y2: r.y + split,
-        gapT: randRange(0.28, 0.72, seed, lot.id, "gap-t", guard),
-        gapWidth: randRange(15, Math.min(34, r.w * 0.34), seed, lot.id, "gap-w", guard),
-      });
+class UnionFind {
+  constructor(n) { this.parent = Array.from({ length: n }, (_, i) => i); this.size = new Array(n).fill(1); }
+  find(x) { while (this.parent[x] !== x) { this.parent[x] = this.parent[this.parent[x]]; x = this.parent[x]; } return x; }
+  union(a, b) {
+    a = this.find(a); b = this.find(b); if (a === b) return a;
+    if (this.size[a] < this.size[b]) [a, b] = [b, a];
+    this.parent[b] = a; this.size[a] += this.size[b]; return a;
+  }
+}
+
+function assignRooms(seed, districtId, cells, adjacency, active, profile, portalMap) {
+  const uf = new UnionFind(cells.length);
+  const areaByRoot = cells.map((cell) => cell.area);
+
+  // A shared portal is one architectural opening, even if a partition vertex cuts through it.
+  for (const ids of portalMap.values()) {
+    const set = new Set(ids);
+    for (const edge of adjacency.edges) {
+      if (set.has(edge.a) && set.has(edge.b)) uf.union(edge.a, edge.b);
     }
   }
 
-  const rooms = leaves.map((r, index) => ({
-    ...r,
-    id: lot.id + ":room:" + index,
-    colorShift: rand01(seed, lot.id, "room-color", index),
-  }));
+  const mergeEdges = adjacency.edges
+    .filter((edge) => active.has(edge.a) && active.has(edge.b))
+    .sort((a, b) => hashParts(seed, districtId, "merge-order", a.id) - hashParts(seed, districtId, "merge-order", b.id) || a.id.localeCompare(b.id));
 
-  const outerDoorWidth = randRange(18, Math.min(42, lot.w * 0.30), seed, lot.id, "outer-door");
-  return { rooms, walls, outerDoorWidth };
+  for (const edge of mergeEdges) {
+    let ra = uf.find(edge.a), rb = uf.find(edge.b);
+    if (ra === rb) continue;
+    const combinedCount = uf.size[ra] + uf.size[rb];
+    const combinedArea = (areaByRoot[ra] ?? cells[ra].area) + (areaByRoot[rb] ?? cells[rb].area);
+    if (combinedCount > profile.maxMerge) continue;
+    if (combinedArea > DISTRICT_SIZE * DISTRICT_SIZE * 0.105) continue;
+    if (!chance(profile.merge, seed, districtId, "merge", edge.id)) continue;
+    const root = uf.union(ra, rb);
+    areaByRoot[root] = combinedArea;
+  }
+
+  const members = new Map();
+  for (const cell of cells) {
+    if (!active.has(cell.index)) continue;
+    const root = uf.find(cell.index);
+    if (!members.has(root)) members.set(root, []);
+    members.get(root).push(cell.index);
+  }
+
+  const roots = [...members.keys()].sort((a, b) => cells[Math.min(...members.get(a))].id.localeCompare(cells[Math.min(...members.get(b))].id));
+  const cellRoom = new Map();
+  const rooms = roots.map((root, index) => {
+    const ids = members.get(root).sort((a, b) => a - b);
+    let area = 0, cx = 0, cy = 0;
+    for (const ci of ids) { area += cells[ci].area; cx += cells[ci].centroid.x * cells[ci].area; cy += cells[ci].centroid.y * cells[ci].area; }
+    const room = { id: districtId + ":room:" + index, cells: ids, area, centroid: { x: cx / area, y: cy / area } };
+    for (const ci of ids) cellRoom.set(ci, room.id);
+    return room;
+  });
+
+  return { rooms, cellRoom };
 }
 
-function stableSignature(data) {
-  let h = 2166136261 >>> 0;
-  const mix = (value) => {
-    const s = String(value);
-    for (let i = 0; i < s.length; i += 1) {
-      h ^= s.charCodeAt(i);
-      h = Math.imul(h, 16777619);
+function roomDoorGraph(seed, districtId, cells, adjacency, active, roomData, profile) {
+  const pairEdges = new Map();
+  for (const edge of adjacency.edges) {
+    if (!active.has(edge.a) || !active.has(edge.b)) continue;
+    const ra = roomData.cellRoom.get(edge.a), rb = roomData.cellRoom.get(edge.b);
+    if (!ra || !rb || ra === rb) continue;
+    const pair = ra < rb ? ra + "|" + rb : rb + "|" + ra;
+    if (!pairEdges.has(pair)) pairEdges.set(pair, []);
+    pairEdges.get(pair).push(edge);
+  }
+
+  const roomIndex = new Map(roomData.rooms.map((room, i) => [room.id, i]));
+  const uf = new UnionFind(roomData.rooms.length);
+  const candidates = [];
+  for (const [pair, edges] of pairEdges) {
+    const [a, b] = pair.split("|");
+    const ordered = [...edges].sort((x, y) => hashParts(seed, districtId, "door-segment", x.id) - hashParts(seed, districtId, "door-segment", y.id));
+    candidates.push({ pair, a, b, edge: ordered[0], score: hashParts(seed, districtId, "door-tree", pair) });
+  }
+  candidates.sort((a, b) => a.score - b.score || a.pair.localeCompare(b.pair));
+
+  const doors = new Map();
+  for (const item of candidates) {
+    const a = roomIndex.get(item.a), b = roomIndex.get(item.b);
+    if (uf.find(a) === uf.find(b)) continue;
+    uf.union(a, b);
+    doors.set(item.pair, makeDoor(seed, districtId, item.pair, item.edge, profile));
+  }
+
+  for (const item of candidates) {
+    if (doors.has(item.pair)) continue;
+    if (chance(profile.loops, seed, districtId, "door-loop", item.pair)) {
+      doors.set(item.pair, makeDoor(seed, districtId, item.pair, item.edge, profile));
     }
+  }
+  return doors;
+}
+
+function makeDoor(seed, districtId, pair, edge, profile) {
+  const dx = edge.p2.x - edge.p1.x, dy = edge.p2.y - edge.p1.y;
+  const length = Math.hypot(dx, dy);
+  const width = Math.min(randRange(profile.door[0], profile.door[1], seed, districtId, "door-width", pair), length * 0.58);
+  const t = clamp(randRange(0.38, 0.62, seed, districtId, "door-position", pair), width / (2 * length) + 0.03, 1 - width / (2 * length) - 0.03);
+  const ux = dx / length, uy = dy / length;
+  const cx = edge.p1.x + dx * t, cy = edge.p1.y + dy * t;
+  return {
+    id: districtId + ":door:" + pair,
+    pair,
+    p1: { x: cx - ux * width / 2, y: cy - uy * width / 2 },
+    p2: { x: cx + ux * width / 2, y: cy + uy * width / 2 },
+    center: { x: cx, y: cy }, width,
   };
+}
 
-  for (const route of data.routes) mix(route.id + ":" + route.x.toFixed(3) + ":" + route.y.toFixed(3));
-  for (const lot of data.lots) {
-    mix(lot.id + ":" + lot.x.toFixed(3) + ":" + lot.y.toFixed(3) + ":" + lot.w.toFixed(3) + ":" + lot.h.toFixed(3));
-    for (const room of lot.rooms) mix(room.id + ":" + room.x.toFixed(3) + ":" + room.y.toFixed(3) + ":" + room.w.toFixed(3) + ":" + room.h.toFixed(3));
+function subtractCollinearGap(a, b, gapA, gapB) {
+  const overlap = sharedSegment(a, b, gapA, gapB);
+  if (!overlap) return [{ p1: a, p2: b }];
+  const dx = b.x - a.x, dy = b.y - a.y, len = Math.hypot(dx, dy);
+  const ux = dx / len, uy = dy / len;
+  const t = (p) => (p.x - a.x) * ux + (p.y - a.y) * uy;
+  let lo = Math.min(t(overlap.p1), t(overlap.p2)), hi = Math.max(t(overlap.p1), t(overlap.p2));
+  lo = clamp(lo, 0, len); hi = clamp(hi, 0, len);
+  const out = [];
+  if (lo > 0.5) out.push({ p1: a, p2: { x: a.x + ux * lo, y: a.y + uy * lo } });
+  if (len - hi > 0.5) out.push({ p1: { x: a.x + ux * hi, y: a.y + uy * hi }, p2: b });
+  return out;
+}
+
+function buildWalls(cells, adjacency, active, roomData, doors, districtPoly, portals) {
+  const walls = [];
+  const doorList = [...doors.values()];
+  const doorByPair = doors;
+
+  for (const edge of adjacency.edges) {
+    const aa = active.has(edge.a), bb = active.has(edge.b);
+    if (!aa && !bb) continue;
+    if (aa && bb) {
+      const ra = roomData.cellRoom.get(edge.a), rb = roomData.cellRoom.get(edge.b);
+      if (ra === rb) continue;
+      const pair = ra < rb ? ra + "|" + rb : rb + "|" + ra;
+      const door = doorByPair.get(pair);
+      if (door) walls.push(...subtractCollinearGap(edge.p1, edge.p2, door.p1, door.p2));
+      else walls.push({ p1: edge.p1, p2: edge.p2 });
+    } else {
+      walls.push({ p1: edge.p1, p2: edge.p2 });
+    }
   }
+
+  // District outer boundary. Only canonical portal intervals are opened.
+  for (const cell of cells) {
+    if (!active.has(cell.index)) continue;
+    for (let i = 0; i < cell.poly.length; i += 1) {
+      const a = cell.poly[i], b = cell.poly[(i + 1) % cell.poly.length];
+      let outer = false;
+      for (let j = 0; j < districtPoly.length; j += 1) {
+        if (sharedSegment(a, b, districtPoly[j], districtPoly[(j + 1) % districtPoly.length])) { outer = true; break; }
+      }
+      if (!outer) continue;
+      let pieces = [{ p1: a, p2: b }];
+      for (const portal of portals) {
+        const next = [];
+        for (const piece of pieces) next.push(...subtractCollinearGap(piece.p1, piece.p2, portal.p1, portal.p2));
+        pieces = next;
+      }
+      walls.push(...pieces);
+    }
+  }
+
+  return { walls, doors: doorList };
+}
+
+function verifyRoomConnectivity(rooms, doors) {
+  if (rooms.length <= 1) return true;
+  const adj = new Map(rooms.map((r) => [r.id, []]));
+  for (const door of doors) {
+    const parts = door.pair.split("|");
+    // room ids themselves contain ':' but not '|'
+    const a = parts[0], b = parts[1];
+    if (adj.has(a) && adj.has(b)) { adj.get(a).push(b); adj.get(b).push(a); }
+  }
+  const seen = new Set([rooms[0].id]);
+  const queue = [rooms[0].id];
+  while (queue.length) {
+    const cur = queue.shift();
+    for (const next of adj.get(cur) ?? []) if (!seen.has(next)) { seen.add(next); queue.push(next); }
+  }
+  return seen.size === rooms.length;
+}
+
+function stableDistrictSignature(district) {
+  let h = 2166136261 >>> 0;
+  const mix = (v) => { const s = String(v); for (let i = 0; i < s.length; i += 1) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } };
+  mix(district.id); mix(district.profile.id); mix(district.palette);
+  for (const cell of district.cells) {
+    if (!cell.active) continue;
+    mix(cell.id + ":" + cell.roomId + ":");
+    for (const p of cell.poly) mix(p.x.toFixed(4) + "," + p.y.toFixed(4) + ";");
+  }
+  for (const wall of district.walls) mix(wall.p1.x.toFixed(3) + "," + wall.p1.y.toFixed(3) + ">" + wall.p2.x.toFixed(3) + "," + wall.p2.y.toFixed(3));
   return (h >>> 0).toString(16).padStart(8, "0");
 }
 
-export class WorldGenerator {
-  constructor(seedText = "71-days-after-arrival") {
-    this.setSeed(seedText);
-  }
+function generateDistrict(seed, mx, my) {
+  const id = "district:" + key2(mx, my);
+  const poly = districtPolygon(seed, mx, my);
+  const profile = profileFor(seed, mx, my);
+  const palette = paletteFor(seed, mx, my);
+  const portals = incidentPortals(seed, mx, my);
+  const cells = subdivideDistrict(seed, id, poly, profile);
+  const adjacency = buildAdjacency(cells);
+  const portalMap = portalCells(cells, portals);
+  const selection = chooseActiveCells(seed, id, cells, adjacency, profile, portals, portalMap, poly);
+  const roomData = assignRooms(seed, id, cells, adjacency, selection.active, profile, portalMap);
+  const doors = roomDoorGraph(seed, id, cells, adjacency, selection.active, roomData, profile);
+  const wallData = buildWalls(cells, adjacency, selection.active, roomData, doors, poly, portals);
 
+  const activeCells = cells.map((cell) => ({
+    ...cell,
+    active: selection.active.has(cell.index),
+    roomId: roomData.cellRoom.get(cell.index) ?? null,
+  }));
+
+  const district = {
+    id, mx, my,
+    poly,
+    bounds: polygonBounds(poly),
+    centroid: polygonCentroid(poly),
+    profile,
+    palette,
+    portals,
+    portalCells: Object.fromEntries([...portalMap.entries()]),
+    cells: activeCells,
+    rooms: roomData.rooms,
+    walls: wallData.walls,
+    doors: wallData.doors,
+    density: selection.density,
+    connected: verifyRoomConnectivity(roomData.rooms, wallData.doors),
+  };
+  district.signature = stableDistrictSignature(district);
+  return district;
+}
+
+function queryDistrictCoords(bounds) {
+  const margin = DISTRICT_SIZE * (DISTRICT_JITTER + 0.12);
+  const minX = Math.floor((bounds.minX - margin) / DISTRICT_SIZE) - 1;
+  const maxX = Math.floor((bounds.maxX + margin) / DISTRICT_SIZE) + 1;
+  const minY = Math.floor((bounds.minY - margin) / DISTRICT_SIZE) - 1;
+  const maxY = Math.floor((bounds.maxY + margin) / DISTRICT_SIZE) + 1;
+  const out = [];
+  for (let y = minY; y <= maxY; y += 1) for (let x = minX; x <= maxX; x += 1) out.push([x, y]);
+  return out;
+}
+
+export class WorldGenerator {
+  constructor(seedText = "71-days-after-arrival") { this.setSeed(seedText); }
   setSeed(seedText) {
     this.seedText = String(seedText || "71-days-after-arrival");
     this.seed = hashString("v" + GENERATOR_VERSION + ":" + this.seedText);
-    this.edgeCache = new Map();
+    this.cache = new Map();
+    this.clock = 0;
   }
-
-  query(bounds) {
-    const influenceBounds = expandAabb(bounds, CONFLICT_HALO);
-    const rawEdges = collectEdges(this.seed, influenceBounds);
-    const edges = rawEdges.map((edge) => {
-      const cached = this.edgeCache.get(edge.key);
-      if (cached) return cached;
-      this.edgeCache.set(edge.key, edge);
-      return edge;
-    });
-
-    const routeMap = new Map();
-    for (const edge of edges) {
-      for (const shape of [...edge.segments, ...edge.chambers]) {
-        if (!routeMap.has(shape.id)) routeMap.set(shape.id, shape);
-      }
+  trimCache(limit = 180) {
+    if (this.cache.size <= limit) return;
+    const entries = [...this.cache.entries()].sort((a, b) => a[1].used - b[1].used || a[0].localeCompare(b[0]));
+    for (let i = 0; i < entries.length - limit; i += 1) this.cache.delete(entries[i][0]);
+  }
+  getDistrict(mx, my) {
+    const key = key2(mx, my);
+    let entry = this.cache.get(key);
+    if (!entry) {
+      entry = { district: generateDistrict(this.seed, mx, my), used: ++this.clock };
+      this.cache.set(key, entry);
+    } else {
+      entry.used = ++this.clock;
     }
-    const routeShapes = [...routeMap.values()];
-
-    let candidates = [];
-    for (const edge of edges) candidates.push(...candidatesForEdge(this.seed, edge));
-    candidates = candidates.filter((candidate) => aabbIntersects(candidate.aabb, influenceBounds));
-
-    const survivors = resolveLots(candidates, routeShapes)
-      .filter((lot) => aabbIntersects(lot.aabb, bounds))
-      .sort((a, b) => a.id.localeCompare(b.id))
-      .map((lot) => ({ ...lot, ...subdivideLot(this.seed, lot) }));
-
-    const routes = routeShapes
-      .filter((shape) => aabbIntersects(shape.aabb, bounds))
+    if (this.cache.size > 220) this.trimCache(180);
+    return entry.district;
+  }
+  query(bounds) {
+    const districts = queryDistrictCoords(bounds)
+      .map(([x, y]) => this.getDistrict(x, y))
+      .filter((d) => boundsIntersect(d.bounds, bounds))
       .sort((a, b) => a.id.localeCompare(b.id));
+    this.trimCache(180);
 
-    const visibleEdges = edges
-      .filter((edge) => aabbIntersects(edge.aabb, bounds))
-      .sort((a, b) => a.key.localeCompare(b.key));
+    const cells = districts.flatMap((d) => d.cells.filter((c) => c.active && boundsIntersect(c.bounds, bounds)).map((c) => ({ ...c, districtId: d.id, palette: d.palette, profileId: d.profile.id })));
+    const walls = districts.flatMap((d) => d.walls.filter((w) => boundsIntersect(polygonBounds([w.p1, w.p2]), bounds)).map((w) => ({ ...w, districtId: d.id, palette: d.palette })));
+    const doors = districts.flatMap((d) => d.doors.map((door) => ({ ...door, districtId: d.id })));
+    const portals = districts.flatMap((d) => d.portals.map((portal) => ({ ...portal, districtId: d.id })));
+    const rooms = districts.flatMap((d) => d.rooms.map((room) => ({ ...room, districtId: d.id, palette: d.palette, profileId: d.profile.id })));
 
-    const data = {
+    let h = 2166136261 >>> 0;
+    const mix = (v) => { const s = String(v); for (let i = 0; i < s.length; i += 1) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } };
+    for (const district of districts) mix(district.id + ":" + district.signature + ";");
+
+    return {
       seed: this.seedText,
       bounds,
-      edges: visibleEdges,
-      routes,
-      lots: survivors,
+      districts,
+      cells,
+      rooms,
+      walls,
+      doors,
+      portals,
       stats: {
-        edges: visibleEdges.length,
-        routes: routes.length,
-        lots: survivors.length,
-        rooms: survivors.reduce((sum, lot) => sum + lot.rooms.length, 0),
-        candidatesConsidered: candidates.length,
+        districts: districts.length,
+        cells: cells.length,
+        rooms: rooms.length,
+        doors: doors.length,
+        portals: portals.length,
+        averageDensity: districts.length ? districts.reduce((s, d) => s + d.density, 0) / districts.length : 0,
       },
+      signature: (h >>> 0).toString(16).padStart(8, "0"),
     };
-    data.signature = stableSignature(data);
-    return data;
   }
 }
 
-export function validateNoLotOverlap(lots) {
-  for (let i = 0; i < lots.length; i += 1) {
-    for (let j = i + 1; j < lots.length; j += 1) {
-      if (obbOverlapStrict(lots[i], lots[j], LOT_CLEARANCE)) {
-        return { ok: false, a: lots[i].id, b: lots[j].id };
-      }
+export function districtSnapshot(generator, mx, my) {
+  const d = generator.getDistrict(mx, my);
+  return {
+    id: d.id,
+    signature: d.signature,
+    profile: d.profile.id,
+    palette: d.palette,
+    portals: d.portals.map((p) => [p.id, p.p1.x, p.p1.y, p.p2.x, p.p2.y]),
+    activeCells: d.cells.filter((c) => c.active).map((c) => [c.id, c.roomId, c.poly.map((p) => [p.x, p.y])]),
+    rooms: d.rooms.map((r) => [r.id, [...r.cells]]),
+  };
+}
+
+export function validateDistrictNoOverlap(district) {
+  const active = district.cells.filter((c) => c.active);
+  for (let i = 0; i < active.length; i += 1) {
+    for (let j = i + 1; j < active.length; j += 1) {
+      const area = convexIntersectionArea(active[i].poly, active[j].poly);
+      if (area > 1e-4) return { ok: false, a: active[i].id, b: active[j].id, area };
     }
   }
   return { ok: true };
 }
 
-export function validateRoomSubdivisions(lot) {
-  for (const room of lot.rooms) {
-    if (room.x < -lot.w / 2 - 1e-6 || room.y < -lot.h / 2 - 1e-6 ||
-        room.x + room.w > lot.w / 2 + 1e-6 || room.y + room.h > lot.h / 2 + 1e-6) {
-      return false;
+export function validateAdjacentDistrictsNoOverlap(a, b) {
+  for (const ca of a.cells.filter((c) => c.active)) {
+    for (const cb of b.cells.filter((c) => c.active)) {
+      if (!boundsIntersect(ca.bounds, cb.bounds)) continue;
+      const area = convexIntersectionArea(ca.poly, cb.poly);
+      if (area > 1e-4) return { ok: false, a: ca.id, b: cb.id, area };
     }
   }
-  for (let i = 0; i < lot.rooms.length; i += 1) {
-    for (let j = i + 1; j < lot.rooms.length; j += 1) {
-      if (rectsOverlapLocal(lot.rooms[i], lot.rooms[j])) return false;
-    }
-  }
-  return true;
+  return { ok: true };
+}
+
+export function validatePortalSymmetry(generator, ax, ay, bx, by) {
+  const a = generator.getDistrict(ax, ay);
+  const b = generator.getDistrict(bx, by);
+  const pair = canonicalPair(ax, ay, bx, by);
+  const pa = a.portals.find((p) => p.pair === pair);
+  const pb = b.portals.find((p) => p.pair === pair);
+  if (!pa || !pb) return false;
+  return Math.hypot(pa.p1.x - pb.p1.x, pa.p1.y - pb.p1.y) < 1e-6 && Math.hypot(pa.p2.x - pb.p2.x, pa.p2.y - pb.p2.y) < 1e-6;
 }

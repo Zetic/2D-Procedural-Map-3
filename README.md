@@ -1,45 +1,66 @@
 # 2D Procedural Map 3
 
-An infinite, deterministic 2D architectural generator designed around **spatial ownership first**.
+An infinite deterministic 2D architectural generator built around **partition ownership and room-graph connectivity**.
 
-This version deliberately avoids the two failure modes explored in the previous prototypes:
+Generator v2 replaces the original route-and-lot prototype completely. There is no route, road, corridor, or post-hoc collision layer in the world model.
 
-- it does **not** generate overlapping rooms and union them into a cave-like mass;
-- it does **not** place rooms sequentially and let earlier runtime generation steal space from later rooms.
-
-## Core model
+## Generation model
 
 ```text
 world seed
-  -> addressable macro topology
-  -> mandatory traversal reservations
-  -> bounded room-lot candidates
-  -> canonical candidate conflict resolution
-  -> non-overlapping lot ownership
-  -> deterministic room subdivision inside each lot
-  -> render/query by world bounds
+  -> infinite warped district tiling
+  -> canonical shared-boundary portal contracts
+  -> recursive non-overlapping spatial partition
+  -> required portal cells
+  -> connected architectural cell selection
+  -> deterministic cell merging into compound rooms
+  -> room-adjacency graph
+  -> spanning doors + optional loop doors
+  -> walls derived from ownership boundaries
 ```
 
-Every room lot has a stable identity, finite influence radius, and stable priority. Two conflicting lots are resolved by identity/priority, not by exploration order. Surviving lot envelopes never overlap. Rooms are then subdivided only inside their surviving envelope, so same-plane room overlap is structurally impossible.
+### Why this differs from the earlier prototypes
 
-Traversal space is generated first from a deterministic infinite parent graph. Rooms cannot consume required route space, so connectivity never has to be repaired after room placement.
+The generator does not place independent rooms and reject collisns. It does not overlap growth primitives and union them into a floor mass. It also does not turn the hidden connectivity topology into visible corridors.
 
-## Properties
+Each district is an exclusive polygon from an infinite warped lattice. The district is subdivided into disjoint convex cells before any room exists. Rooms are unions of those cells. Two rooms therefore cannot occupy the same positive-area space by construction.
 
-- Infinite world-space query model
-- Deterministic seed and shareable URL
-- Exploration-order independent
-- Guaranteed connected macro traversal tree
-- Optional deterministic loops
-- Zero overlap between surviving room lots
-- Bounded local influence: no global simulation or backtracking
-- Rotated architectural districts and rooms
-- Multiple deterministic architecture profiles
-- Pan/zoom canvas viewer
-- Debug overlays for macro routes, candidate envelopes, and IDs
-- PNG export
-- GitHub Pages deployment
-- Node regression tests
+Connectivity is expressed only as shared boundary portal obligations. Inside a district, portal cells are connected through the ordinary cell adjacency graph. A deterministic spanning set of doors makes every generated room reachable; extra doors add loops. A corridor only appears visually if the partition happens to produce a long narrow room.
+
+## Deterministic infinity
+
+All decisions are addressed by:
+
+```text
+generator version + world seed + stable district/cell/boundary identity
+```
+
+Streaming/query order cannot change a coordinate. Adjacent districts derive the exact same portal segment from the same canonical boundary key.
+
+Every district except the origin has a required parent edge that strictly reduces Manhattan rank toward `(0,0)`. Since every district internally connects all of its portal rooms, the infinite architecture is globally connected through room-to-room boundary openings without a road layer.
+
+## Architectural variation
+
+District profiles currently include office, service, institutional, liminal, archive, flooded, and overgrown families. Profiles alter partition density, occupied-space density, compound-room merging, room-door widths, loops, and the number of large architectural lobes.
+
+Color is assigned in multi-district zones so connectivity does not reveal itself as long colored strips.
+
+## Validation
+
+The test suite checks:
+
+- strict parent-rank decrease toward the origin
+- seed/address determinism
+- exploration-order invariance
+- query-size invariance
+- zero positive-area overlap inside districts
+- zero positive-area overlap across adjacent districts
+- exact shared portal symmetry
+- connected room graphs inside sampled districts
+- no exposed route/corridor generation layer
+- architectural density and profile variation
+
+A stress pass across 1,620 generated districts also completed with zero overlap or connectivity failures during development.
 
 ## Development
 
@@ -52,8 +73,4 @@ Then open `http://localhost:8080`.
 
 ## GitHub Pages
 
-The included workflow validates the generator before publishing the repository root. In **Settings -> Pages**, select **GitHub Actions** if Pages has not been enabled yet.
-
-## Important limitation
-
-The system uses a finite maximum room-lot size and a finite route influence radius. Those bounds are intentional: an infinite deterministic generator cannot answer a local query with guaranteed collision freedom if arbitrarily distant, arbitrarily large features are allowed to affect the queried point.
+The included workflow runs the tests before deploying the repository root. If Pages has never been enabled for the repository, select **Settings -> Pages -> Build and deployment -> GitHub Actions** once, then rerun the workflow.

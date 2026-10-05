@@ -8,21 +8,19 @@ const randomButton = document.querySelector("#random");
 const homeButton = document.querySelector("#home");
 const exportButton = document.querySelector("#export");
 const stats = document.querySelector("#stats");
-const debugRoutes = document.querySelector("#debugRoutes");
-const debugLots = document.querySelector("#debugLots");
+const debugPortals = document.querySelector("#debugPortals");
+const debugDistricts = document.querySelector("#debugDistricts");
 const debugIds = document.querySelector("#debugIds");
 
 const params = new URLSearchParams(location.search);
 const initialSeed = params.get("seed") || "71-days-after-arrival";
-
 const camera = {
-  x: Number(params.get("x")) || 550,
-  y: Number(params.get("y")) || 550,
-  scale: Math.max(0.07, Math.min(2.4, Number(params.get("s")) || 0.34)),
+  x: Number(params.get("x")) || 520,
+  y: Number(params.get("y")) || 520,
+  scale: Math.max(0.13, Math.min(2.5, Number(params.get("s")) || 0.30)),
 };
 
 seedInput.value = initialSeed;
-
 const generator = new WorldGenerator(initialSeed);
 const renderer = new MapRenderer(canvas);
 
@@ -54,9 +52,9 @@ function renderNow() {
   lastData = data;
   renderer.render(data, camera);
   stats.textContent =
-    `v${GENERATOR_VERSION} · ${data.stats.rooms} rooms · ${data.stats.lots} lots · ` +
-    `${data.stats.edges} macro edges · ${data.stats.candidatesConsidered} candidates · ` +
-    `${elapsed.toFixed(1)} ms · sig ${data.signature}`;
+    `v${GENERATOR_VERSION} · ${data.stats.rooms} rooms · ${data.stats.cells} owned cells · ` +
+    `${data.stats.districts} districts · ${data.stats.doors} doors · ` +
+    `${(data.stats.averageDensity * 100).toFixed(0)}% mean fill · ${elapsed.toFixed(1)} ms · sig ${data.signature}`;
   updateUrlSoon();
 }
 
@@ -74,9 +72,7 @@ function applySeed() {
 }
 
 applyButton.addEventListener("click", applySeed);
-seedInput.addEventListener("keydown", (event) => {
-  if (event.key === "Enter") applySeed();
-});
+seedInput.addEventListener("keydown", (event) => { if (event.key === "Enter") applySeed(); });
 
 randomButton.addEventListener("click", () => {
   const bytes = new Uint32Array(2);
@@ -86,9 +82,9 @@ randomButton.addEventListener("click", () => {
 });
 
 homeButton.addEventListener("click", () => {
-  camera.x = 550;
-  camera.y = 550;
-  camera.scale = 0.34;
+  camera.x = 520;
+  camera.y = 520;
+  camera.scale = 0.30;
   scheduleRender();
 });
 
@@ -97,18 +93,9 @@ exportButton.addEventListener("click", () => {
   renderer.exportPng(`map-${generator.seedText.replace(/[^a-z0-9_-]+/gi, "-")}.png`);
 });
 
-debugRoutes.addEventListener("change", () => {
-  renderer.debug.routes = debugRoutes.checked;
-  scheduleRender();
-});
-debugLots.addEventListener("change", () => {
-  renderer.debug.lots = debugLots.checked;
-  scheduleRender();
-});
-debugIds.addEventListener("change", () => {
-  renderer.debug.ids = debugIds.checked;
-  scheduleRender();
-});
+debugPortals.addEventListener("change", () => { renderer.debug.portals = debugPortals.checked; scheduleRender(); });
+debugDistricts.addEventListener("change", () => { renderer.debug.districts = debugDistricts.checked; scheduleRender(); });
+debugIds.addEventListener("change", () => { renderer.debug.ids = debugIds.checked; scheduleRender(); });
 
 canvas.addEventListener("pointerdown", (event) => {
   dragging = true;
@@ -132,11 +119,8 @@ canvas.addEventListener("pointermove", (event) => {
 function stopDrag(event) {
   dragging = false;
   canvas.classList.remove("dragging");
-  if (event.pointerId !== undefined && canvas.hasPointerCapture(event.pointerId)) {
-    canvas.releasePointerCapture(event.pointerId);
-  }
+  if (event.pointerId !== undefined && canvas.hasPointerCapture(event.pointerId)) canvas.releasePointerCapture(event.pointerId);
 }
-
 canvas.addEventListener("pointerup", stopDrag);
 canvas.addEventListener("pointercancel", stopDrag);
 
@@ -147,10 +131,7 @@ canvas.addEventListener("wheel", (event) => {
   const py = event.clientY - rect.top;
   const beforeX = camera.x + (px - rect.width / 2) / camera.scale;
   const beforeY = camera.y + (py - rect.height / 2) / camera.scale;
-
-  const factor = Math.exp(-event.deltaY * 0.0012);
-  camera.scale = Math.max(0.07, Math.min(2.4, camera.scale * factor));
-
+  camera.scale = Math.max(0.13, Math.min(2.5, camera.scale * Math.exp(-event.deltaY * 0.0012)));
   const afterX = camera.x + (px - rect.width / 2) / camera.scale;
   const afterY = camera.y + (py - rect.height / 2) / camera.scale;
   camera.x += beforeX - afterX;

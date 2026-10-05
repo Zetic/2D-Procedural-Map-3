@@ -1,98 +1,12 @@
-import { localToWorld, polygonPath } from "./geometry.js";
 import { PALETTES } from "./world.js";
 
 const BG = "#4b4b4b";
 
-function strokeSegment(ctx, a, b, gapCenter = null, gapWidth = 0) {
-  if (gapCenter === null || gapWidth <= 0) {
-    ctx.beginPath();
-    ctx.moveTo(a.x, a.y);
-    ctx.lineTo(b.x, b.y);
-    ctx.stroke();
-    return;
-  }
-
-  const dx = b.x - a.x;
-  const dy = b.y - a.y;
-  const len = Math.hypot(dx, dy);
-  if (len <= 1e-6) return;
-  const halfT = Math.min(0.45, gapWidth / (2 * len));
-  const t0 = Math.max(0, gapCenter - halfT);
-  const t1 = Math.min(1, gapCenter + halfT);
-
-  ctx.beginPath();
-  ctx.moveTo(a.x, a.y);
-  ctx.lineTo(a.x + dx * t0, a.y + dy * t0);
-  ctx.moveTo(a.x + dx * t1, a.y + dy * t1);
-  ctx.lineTo(b.x, b.y);
-  ctx.stroke();
-}
-
-function drawRouteShape(ctx, shape, scale) {
-  const palette = PALETTES[shape.palette % PALETTES.length];
-  polygonPath(ctx, shape.corners);
-  ctx.fillStyle = palette.route;
-  ctx.fill();
-  ctx.strokeStyle = palette.wall;
-  ctx.lineWidth = Math.max(1.2 / scale, 1.6);
-  ctx.globalAlpha = 0.82;
-  ctx.stroke();
-  ctx.globalAlpha = 1;
-}
-
-function drawLotFloor(ctx, lot) {
-  const palette = PALETTES[lot.palette % PALETTES.length];
-  polygonPath(ctx, lot.corners);
-  ctx.fillStyle = palette.floor;
-  ctx.fill();
-}
-
-function drawLotWalls(ctx, lot, scale) {
-  const palette = PALETTES[lot.palette % PALETTES.length];
-  ctx.strokeStyle = palette.wall;
-  ctx.lineWidth = Math.max(1.3 / scale, 1.8);
-  ctx.lineCap = "butt";
-
-  const hw = lot.w / 2;
-  const hh = lot.h / 2;
-  const localCorners = [
-    [-hw, -hh],
-    [hw, -hh],
-    [hw, hh],
-    [-hw, hh],
-  ];
-  const corners = localCorners.map(([x, y]) => localToWorld(lot, x, y));
-
-  // doorSide -1 means the wall nearest the parent route is local -Y.
-  const doorEdge = lot.doorSide < 0 ? 0 : 2;
-  for (let i = 0; i < 4; i += 1) {
-    const a = corners[i];
-    const b = corners[(i + 1) % 4];
-    if (i === doorEdge) strokeSegment(ctx, a, b, 0.5, lot.outerDoorWidth);
-    else strokeSegment(ctx, a, b);
-  }
-
-  for (const wall of lot.walls) {
-    const a = localToWorld(lot, wall.x1, wall.y1);
-    const b = localToWorld(lot, wall.x2, wall.y2);
-    const length = Math.hypot(wall.x2 - wall.x1, wall.y2 - wall.y1);
-    const gapT = wall.gapT;
-    const gapWidth = Math.min(wall.gapWidth, length * 0.52);
-    strokeSegment(ctx, a, b, gapT, gapWidth);
-  }
-}
-
-function drawRoomTone(ctx, lot, room) {
-  const p0 = localToWorld(lot, room.x, room.y);
-  const p1 = localToWorld(lot, room.x + room.w, room.y);
-  const p2 = localToWorld(lot, room.x + room.w, room.y + room.h);
-  const p3 = localToWorld(lot, room.x, room.y + room.h);
-  ctx.save();
-  ctx.globalAlpha = room.colorShift < 0.5 ? 0.028 : 0.016;
-  ctx.fillStyle = room.colorShift < 0.5 ? "#000000" : "#ffffff";
-  polygonPath(ctx, [p0, p1, p2, p3]);
-  ctx.fill();
-  ctx.restore();
+function appendPolygon(ctx, poly) {
+  if (!poly?.length) return;
+  ctx.moveTo(poly[0].x, poly[0].y);
+  for (let i = 1; i < poly.length; i += 1) ctx.lineTo(poly[i].x, poly[i].y);
+  ctx.closePath();
 }
 
 function worldBounds(canvas, camera) {
@@ -110,7 +24,7 @@ export class MapRenderer {
   constructor(canvas) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
-    this.debug = { routes: false, lots: false, ids: false };
+    this.debug = { portals: false, districts: false, ids: false };
   }
 
   resize() {
@@ -124,9 +38,7 @@ export class MapRenderer {
     return ratio;
   }
 
-  getBounds(camera) {
-    return worldBounds(this.canvas, camera);
-  }
+  getBounds(camera) { return worldBounds(this.canvas, camera); }
 
   render(data, camera) {
     const ratio = this.resize();
@@ -143,50 +55,72 @@ export class MapRenderer {
     ctx.scale(camera.scale, camera.scale);
     ctx.translate(-camera.x, -camera.y);
 
-    for (const route of data.routes) drawRouteShape(ctx, route, camera.scale);
-
-    for (const lot of data.lots) {
-      drawLotFloor(ctx, lot);
-      for (const room of lot.rooms) drawRoomTone(ctx, lot, room);
+    // Fill all cells of a palette in one path. Shared partition edges therefore
+    // do not produce raster hairlines, and room identity remains a wall concern.
+    for (let palette = 0; palette < PALETTES.length; palette += 1) {
+      const cells = data.cells.filter((cell) => cell.palette === palette);
+      if (!cells.length) continue;
+      ctx.beginPath();
+      for (const cell of cells) appendPolygon(ctx, cell.poly);
+      ctx.fillStyle = PALETTES[palette].floor;
+      ctx.fill();
     }
 
-    for (const lot of data.lots) drawLotWalls(ctx, lot, camera.scale);
-
-    if (this.debug.routes) {
-      ctx.save();
-      ctx.strokeStyle = "#ff6f61";
-      ctx.fillStyle = "#ff8a7e";
-      ctx.lineWidth = Math.max(1.1 / camera.scale, 1.2);
-      ctx.setLineDash([18 / camera.scale, 12 / camera.scale]);
-      for (const edge of data.edges) {
-        ctx.beginPath();
-        ctx.moveTo(edge.points[0].x, edge.points[0].y);
-        for (let i = 1; i < edge.points.length; i += 1) ctx.lineTo(edge.points[i].x, edge.points[i].y);
-        ctx.stroke();
+    // Semantic room walls. There is no route/corridor rendering layer.
+    ctx.lineCap = "butt";
+    ctx.lineJoin = "miter";
+    for (let palette = 0; palette < PALETTES.length; palette += 1) {
+      const walls = data.walls.filter((wall) => wall.palette === palette);
+      if (!walls.length) continue;
+      ctx.beginPath();
+      for (const wall of walls) {
+        ctx.moveTo(wall.p1.x, wall.p1.y);
+        ctx.lineTo(wall.p2.x, wall.p2.y);
       }
-      ctx.restore();
+      ctx.strokeStyle = PALETTES[palette].wall;
+      ctx.lineWidth = Math.max(1.25 / camera.scale, 2.0);
+      ctx.stroke();
     }
 
-    if (this.debug.lots) {
+    if (this.debug.districts) {
       ctx.save();
       ctx.strokeStyle = "#75d5ff";
-      ctx.lineWidth = Math.max(1 / camera.scale, 1);
-      ctx.setLineDash([12 / camera.scale, 8 / camera.scale]);
-      for (const lot of data.lots) {
-        polygonPath(ctx, lot.corners);
+      ctx.lineWidth = Math.max(1 / camera.scale, 1.2);
+      ctx.setLineDash([18 / camera.scale, 12 / camera.scale]);
+      for (const district of data.districts) {
+        ctx.beginPath();
+        appendPolygon(ctx, district.poly);
         ctx.stroke();
       }
       ctx.restore();
     }
 
-    if (this.debug.ids && camera.scale > 0.18) {
+    if (this.debug.portals) {
       ctx.save();
-      ctx.fillStyle = "#333";
-      ctx.font = `${Math.max(9 / camera.scale, 12)}px ui-monospace, monospace`;
+      ctx.strokeStyle = "#ff6f61";
+      ctx.fillStyle = "#ff6f61";
+      ctx.lineWidth = Math.max(3 / camera.scale, 4);
+      for (const portal of data.portals) {
+        ctx.beginPath();
+        ctx.moveTo(portal.p1.x, portal.p1.y);
+        ctx.lineTo(portal.p2.x, portal.p2.y);
+        ctx.stroke();
+        const r = Math.max(3 / camera.scale, 4);
+        ctx.beginPath();
+        ctx.arc(portal.center.x, portal.center.y, r, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      ctx.restore();
+    }
+
+    if (this.debug.ids && camera.scale > 0.11) {
+      ctx.save();
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      for (const lot of data.lots) {
-        ctx.fillText(lot.profile.id, lot.x, lot.y);
+      ctx.font = `${Math.max(10 / camera.scale, 13)}px ui-monospace, monospace`;
+      ctx.fillStyle = "rgba(25,25,25,.75)";
+      for (const district of data.districts) {
+        ctx.fillText(`${district.mx},${district.my} · ${district.profile.id}`, district.centroid.x, district.centroid.y);
       }
       ctx.restore();
     }
